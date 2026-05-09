@@ -21,6 +21,22 @@ if sys.platform == "win32":
 
 import typer
 from loguru import logger
+
+# Remove default handler and re-add with unified nanobot format
+logger.remove()
+_log_handler_id = logger.add(
+    sys.stderr,
+    format=(
+        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+        "<level>{level: <5}</level> | "
+        "<cyan>{extra[channel]}</cyan> | "
+        "<level>{message}</level>"
+    ),
+    level="INFO",
+    colorize=None,
+    filter=lambda record: record["extra"].setdefault("channel", "-") or True,
+)
+
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.formatted_text import ANSI, HTML
@@ -34,6 +50,17 @@ from rich.text import Text
 from nanobot import __logo__, __version__
 
 
+def _sanitize_surrogates(text: str) -> str:
+    """Reconstruct surrogate pairs into real characters; replace lone surrogates.
+
+    On Windows, console input may produce lone surrogate code points (e.g.
+    ``\\ud83d\\udc08`` for U+1F408).  Round-tripping through UTF-16 reconstructs
+    paired surrogates into their actual characters and replaces unpaired ones
+    with U+FFFD.
+    """
+    return text.encode("utf-16-le", errors="surrogatepass").decode("utf-16-le", errors="replace")
+
+
 class SafeFileHistory(FileHistory):
     """FileHistory subclass that sanitizes surrogate characters on write.
 
@@ -43,8 +70,7 @@ class SafeFileHistory(FileHistory):
     """
 
     def store_string(self, string: str) -> None:
-        safe = string.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
-        super().store_string(safe)
+        super().store_string(_sanitize_surrogates(string))
 from nanobot.cli.stream import StreamRenderer, ThinkingSpinner
 from nanobot.config.paths import get_workspace_path, is_default_workspace
 from nanobot.config.schema import Config
@@ -512,6 +538,7 @@ def serve(
         raise typer.Exit(1)
 
     from loguru import logger
+
     from nanobot.agent.loop import AgentLoop
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
@@ -541,6 +568,7 @@ def serve(
         context_block_limit=runtime_config.agents.defaults.context_block_limit,
         max_tool_result_chars=runtime_config.agents.defaults.max_tool_result_chars,
         provider_retry_mode=runtime_config.agents.defaults.provider_retry_mode,
+        tool_hint_max_length=runtime_config.agents.defaults.tool_hint_max_length,
         web_config=runtime_config.tools.web,
         exec_config=runtime_config.tools.exec,
         restrict_to_workspace=runtime_config.tools.restrict_to_workspace,
@@ -554,6 +582,10 @@ def serve(
         consolidation_ratio=runtime_config.agents.defaults.consolidation_ratio,
         max_messages=runtime_config.agents.defaults.max_messages,
         tools_config=runtime_config.tools,
+        image_generation_provider_configs={
+            "openrouter": runtime_config.providers.openrouter,
+            "aihubmix": runtime_config.providers.aihubmix,
+        },
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -597,9 +629,19 @@ def gateway(
 ):
     """Start the nanobot gateway."""
     if verbose:
-        import logging
-
-        logging.basicConfig(level=logging.DEBUG)
+        logger.remove(_log_handler_id)
+        logger.add(
+            sys.stderr,
+            format=(
+                "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+                "<level>{level: <5}</level> | "
+                "<cyan>{extra[channel]}</cyan> | "
+                "<level>{message}</level>"
+            ),
+            level="DEBUG",
+            colorize=None,
+            filter=lambda record: record["extra"].setdefault("channel", "-") or True,
+        )
     cfg = _load_runtime_config(config, workspace)
     _run_gateway(cfg, port=port)
 
@@ -655,6 +697,7 @@ def _run_gateway(
         context_block_limit=config.agents.defaults.context_block_limit,
         max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
         provider_retry_mode=config.agents.defaults.provider_retry_mode,
+        tool_hint_max_length=config.agents.defaults.tool_hint_max_length,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -668,6 +711,10 @@ def _run_gateway(
         consolidation_ratio=config.agents.defaults.consolidation_ratio,
         max_messages=config.agents.defaults.max_messages,
         tools_config=config.tools,
+        image_generation_provider_configs={
+            "openrouter": config.providers.openrouter,
+            "aihubmix": config.providers.aihubmix,
+        },
         provider_snapshot_loader=load_provider_snapshot,
         provider_signature=provider_snapshot.signature,
     )
@@ -707,7 +754,10 @@ def _run_gateway(
         ):
             key = session_key or _channel_session_key(msg.channel, msg.chat_id)
             session = session_manager.get_or_create(key)
-            session.add_message("assistant", msg.content, _channel_delivery=True)
+            extra: dict[str, Any] = {"_channel_delivery": True}
+            if msg.media:
+                extra["media"] = list(msg.media)
+            session.add_message("assistant", msg.content, **extra)
             session_manager.save(session)
         await bus.publish_outbound(msg)
 
@@ -1047,6 +1097,7 @@ def agent(
         context_block_limit=config.agents.defaults.context_block_limit,
         max_tool_result_chars=config.agents.defaults.max_tool_result_chars,
         provider_retry_mode=config.agents.defaults.provider_retry_mode,
+        tool_hint_max_length=config.agents.defaults.tool_hint_max_length,
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -1183,7 +1234,7 @@ def agent(
                         # Stop spinner before user input to avoid prompt_toolkit conflicts
                         if renderer:
                             renderer.stop_for_input()
-                        user_input = await _read_interactive_input_async()
+                        user_input = _sanitize_surrogates(await _read_interactive_input_async())
                         command = user_input.strip()
                         if not command:
                             continue

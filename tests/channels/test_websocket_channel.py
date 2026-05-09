@@ -168,6 +168,40 @@ def test_issue_route_secret_matches_empty_secret() -> None:
 
 
 @pytest.mark.asyncio
+async def test_webui_message_envelope_marks_inbound_metadata(bus: MagicMock) -> None:
+    channel = _ch(bus)
+    conn = MagicMock()
+    conn.remote_address = ("127.0.0.1", 50123)
+
+    await channel._dispatch_envelope(
+        conn,
+        "webui-client",
+        {"type": "message", "chat_id": "chat-1", "content": "hello", "webui": True},
+    )
+
+    msg = bus.publish_inbound.await_args.args[0]
+    assert msg.channel == "websocket"
+    assert msg.chat_id == "chat-1"
+    assert msg.metadata["webui"] is True
+    assert msg.metadata["_wants_stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_plain_websocket_message_does_not_mark_webui(bus: MagicMock) -> None:
+    channel = _ch(bus)
+    conn = MagicMock()
+
+    await channel._dispatch_envelope(
+        conn,
+        "custom-client",
+        {"type": "message", "chat_id": "chat-1", "content": "hello"},
+    )
+
+    msg = bus.publish_inbound.await_args.args[0]
+    assert "webui" not in msg.metadata
+
+
+@pytest.mark.asyncio
 async def test_send_delivers_json_message_with_media_and_reply() -> None:
     bus = MagicMock()
     channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus)
@@ -304,6 +338,25 @@ async def test_send_turn_end_emits_turn_end_event() -> None:
     mock_ws.send.assert_awaited_once()
     body = json.loads(mock_ws.send.await_args.args[0])
     assert body == {"event": "turn_end", "chat_id": "chat-1"}
+
+
+@pytest.mark.asyncio
+async def test_send_session_updated_emits_session_updated_event() -> None:
+    bus = MagicMock()
+    channel = WebSocketChannel({"enabled": True, "allowFrom": ["*"]}, bus)
+    mock_ws = AsyncMock()
+    channel._attach(mock_ws, "chat-1")
+
+    await channel.send(OutboundMessage(
+        channel="websocket",
+        chat_id="chat-1",
+        content="",
+        metadata={"_session_updated": True},
+    ))
+
+    mock_ws.send.assert_awaited_once()
+    body = json.loads(mock_ws.send.await_args.args[0])
+    assert body == {"event": "session_updated", "chat_id": "chat-1"}
 
 
 @pytest.mark.asyncio
@@ -489,9 +542,25 @@ async def test_settings_api_returns_safe_subset_and_updates_whitelist(
         body = settings.json()
         assert body["agent"]["model"] == "openai/gpt-4o"
         assert body["agent"]["provider"] == "openai"
-        assert {"name": "auto", "label": "Auto"} in body["providers"]
+        providers = {provider["name"]: provider for provider in body["providers"]}
+        assert providers["openai"]["configured"] is True
+        assert providers["openai"]["api_key_hint"] == "secr••••-key"
+        assert providers["openrouter"]["configured"] is False
         assert body["agent"]["has_api_key"] is True
         assert "secret-key" not in settings.text
+
+        provider_updated = await _http_get(
+            "http://127.0.0.1:"
+            f"{port}/api/settings/provider/update?provider=openrouter"
+            "&api_key=sk-or-test&api_base=https%3A%2F%2Fopenrouter.ai%2Fapi%2Fv1",
+            headers={"Authorization": "Bearer tok"},
+        )
+        assert provider_updated.status_code == 200
+        provider_body = provider_updated.json()
+        assert provider_body["requires_restart"] is False
+        provider_rows = {provider["name"]: provider for provider in provider_body["providers"]}
+        assert provider_rows["openrouter"]["configured"] is True
+        assert "sk-or-test" not in provider_updated.text
 
         updated = await _http_get(
             "http://127.0.0.1:"
@@ -500,11 +569,41 @@ async def test_settings_api_returns_safe_subset_and_updates_whitelist(
             headers={"Authorization": "Bearer tok"},
         )
         assert updated.status_code == 200
-        assert updated.json()["requires_restart"] is True
+        assert updated.json()["requires_restart"] is False
 
         saved = load_config(config_path)
         assert saved.agents.defaults.model == "openrouter/test"
         assert saved.agents.defaults.provider == "openrouter"
+        assert saved.providers.openrouter.api_key == "sk-or-test"
+        assert saved.providers.openrouter.api_base == "https://openrouter.ai/api/v1"
+    finally:
+        await channel.stop()
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_commands_api_returns_slash_command_metadata(bus: MagicMock) -> None:
+    port = 29892
+    channel = _ch(bus, port=port)
+    channel._api_tokens["tok"] = time.monotonic() + 300
+
+    server_task = asyncio.create_task(channel.start())
+    await asyncio.sleep(0.3)
+
+    try:
+        denied = await _http_get(f"http://127.0.0.1:{port}/api/commands")
+        assert denied.status_code == 401
+
+        response = await _http_get(
+            f"http://127.0.0.1:{port}/api/commands",
+            headers={"Authorization": "Bearer tok"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        commands = {row["command"]: row for row in body["commands"]}
+        assert commands["/stop"]["title"] == "Stop current task"
+        assert commands["/history"]["arg_hint"] == "[n]"
+        assert all("description" in row for row in body["commands"])
     finally:
         await channel.stop()
         await server_task
