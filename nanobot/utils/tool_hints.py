@@ -11,10 +11,12 @@ _TOOL_FORMATS: dict[str, tuple[list[str], str, bool, bool]] = {
     "read_file":  (["path", "file_path"],              "read {}",     True,  False),
     "write_file": (["path", "file_path"],              "write {}",    True,  False),
     "edit":       (["file_path", "path"],              "edit {}",     True,  False),
-    "glob":       (["pattern"],                        'glob "{}"',   False, False),
+    "find_files": (["query", "glob", "path"],           "find {}",     False, False),
     "grep":       (["pattern"],                        'grep "{}"',   False, False),
     "exec":       (["command"],                        "$ {}",        False, True),
+    "list_exec_sessions": ([],                          "exec sessions", False, False),
     "web_search": (["query"],                          'search "{}"', False, False),
+    "x_search":   (["query"],                        'search X "{}"', False, False),
     "web_fetch":  (["url"],                            "fetch {}",    True,  False),
     "list_dir":   (["path"],                           "ls {}",       True,  False),
 }
@@ -34,10 +36,15 @@ def format_tool_hints(tool_calls: list, max_length: int = 40) -> str:
 
     formatted = []
     for tc in tool_calls:
-        fmt = _TOOL_FORMATS.get(tc.name)
+        name = getattr(tc, "name", None)
+        if not isinstance(name, str) or not name:
+            # Degenerate/malformed tool call (e.g. a model emits name=None);
+            # skip it instead of raising AttributeError on the whole turn.
+            continue
+        fmt = _TOOL_FORMATS.get(name)
         if fmt:
             formatted.append(_fmt_known(tc, fmt, max_length))
-        elif tc.name.startswith("mcp_"):
+        elif name.startswith("mcp_"):
             formatted.append(_fmt_mcp(tc, max_length))
         else:
             formatted.append(_fmt_fallback(tc, max_length))
@@ -82,6 +89,8 @@ def _extract_arg(tc, key_args: list[str]) -> str | None:
 
 def _fmt_known(tc, fmt: tuple, max_length: int = 40) -> str:
     """Format a registered tool using its template."""
+    if not fmt[0] and "{}" not in fmt[1]:
+        return fmt[1]
     val = _extract_arg(tc, fmt[0])
     if val is None:
         return tc.name

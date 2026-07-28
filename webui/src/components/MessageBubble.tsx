@@ -1,30 +1,86 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, ChevronRight, Copy, FileIcon, ImageIcon, PlaySquare, Wrench } from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import {
+  Check,
+  ChevronRight,
+  Clock3,
+  Copy,
+  ImageIcon,
+  Quote,
+  Wrench,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { AttachmentTile } from "@/components/AttachmentTile";
 import { ImageLightbox } from "@/components/ImageLightbox";
 import { MarkdownText } from "@/components/MarkdownText";
+import { SlashCommandText } from "@/components/SlashCommandText";
+import { ReasoningRow } from "@/components/thread/activity/ReasoningRow";
+import { UserMessageText } from "@/components/UserMessageText";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import type { UIImage, UIMediaAttachment, UIMessage } from "@/lib/types";
+import { copyTextToClipboard } from "@/lib/clipboard";
+import { fmtDateTime, formatMessageEndTime } from "@/lib/format";
+import { toMediaAttachment } from "@/lib/media";
+import { matchingSlashCommand } from "@/lib/slash-command";
+import { parseQuotedUserMessage } from "@/lib/user-message-quote";
+import type {
+  CliAppInfo,
+  McpPresetInfo,
+  SlashCommand,
+  UICliAppAttachment,
+  UIMcpPresetAttachment,
+  UIImage,
+  UIMediaAttachment,
+  UIMessage,
+} from "@/lib/types";
 
 interface MessageBubbleProps {
   message: UIMessage;
+  /** When false, hide this message's copy button. Default true. */
+  showCopyAction?: boolean;
+  cliApps?: CliAppInfo[];
+  mcpPresets?: McpPresetInfo[];
+  slashCommands?: SlashCommand[];
+  onOpenFilePreview?: (path: string) => void;
+  onForkFromHere?: () => void;
 }
 
-/**
- * Render a single message. Following agent-chat-ui: user turns are a rounded
- * "pill" right-aligned with a muted fill; assistant turns render as bare
- * markdown so prose/code read like a document rather than a chat bubble.
- * Each turn fades+slides in for a touch of motion polish.
- *
- * Trace rows (tool-call hints, progress breadcrumbs) render as a subdued
- * collapsible group so intermediate steps never masquerade as replies.
- */
-export function MessageBubble({ message }: MessageBubbleProps) {
+function ForkArrowIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden
+    >
+      <path d="M16 3h5v5" />
+      <path d="M8 3H3v5" />
+      <path d="m21 3-7.536 7.536A5 5 0 0 0 12 14.07V21" />
+      <path d="m3 3 7.536 7.536A5 5 0 0 1 12 14.07V15" />
+    </svg>
+  );
+}
+
+function MessageCopyButton({ content }: { content: string }) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
   const copyResetRef = useRef<number | null>(null);
-  const baseAnim = "animate-in fade-in-0 slide-in-from-bottom-1 duration-300";
 
   useEffect(() => {
     return () => {
@@ -34,9 +90,9 @@ export function MessageBubble({ message }: MessageBubbleProps) {
     };
   }, []);
 
-  const onCopyAssistantReply = useCallback(() => {
-    if (!navigator.clipboard) return;
-    void navigator.clipboard.writeText(message.content).then(() => {
+  const onCopy = useCallback(() => {
+    void copyTextToClipboard(content).then((ok) => {
+      if (!ok) return;
       setCopied(true);
       if (copyResetRef.current !== null) {
         window.clearTimeout(copyResetRef.current);
@@ -46,7 +102,54 @@ export function MessageBubble({ message }: MessageBubbleProps) {
         copyResetRef.current = null;
       }, 1_500);
     });
-  }, [message.content]);
+  }, [content]);
+
+  const label = copied ? t("message.copiedReply") : t("message.copyReply");
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          onClick={onCopy}
+          aria-label={label}
+          className={cn(
+            "touch-target inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full",
+            "transition-colors hover:bg-muted/55 hover:text-foreground",
+            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+          )}
+        >
+          {copied ? (
+            <Check className="h-4 w-4" aria-hidden />
+          ) : (
+            <Copy className="h-4 w-4" aria-hidden />
+          )}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top" align="center">{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+/** Render user turns as compact bubbles and assistant turns as document-like prose. */
+export function MessageBubble({
+  message,
+  showCopyAction = true,
+  cliApps = [],
+  mcpPresets = [],
+  slashCommands = [],
+  onOpenFilePreview,
+  onForkFromHere,
+}: MessageBubbleProps) {
+  const { t } = useTranslation();
+  const baseAnim = "animate-in fade-in-0 slide-in-from-bottom-1 duration-300";
+  const mentionCliApps = useMemo(
+    () => mergeCliMentionApps(cliApps, message.cliApps),
+    [cliApps, message.cliApps],
+  );
+  const mentionMcpPresets = useMemo(
+    () => mergeMcpMentionPresets(mcpPresets, message.mcpPresets),
+    [mcpPresets, message.mcpPresets],
+  );
 
   if (message.kind === "trace") {
     return <TraceGroup message={message} animClass={baseAnim} />;
@@ -57,7 +160,27 @@ export function MessageBubble({ message }: MessageBubbleProps) {
     const media = message.media ?? [];
     const hasImages = images.length > 0;
     const hasMedia = media.length > 0;
-    const hasText = message.content.trim().length > 0;
+    const parsedMessage = parseQuotedUserMessage(message.content);
+    const userContent = parsedMessage.content;
+    const hasText = userContent.trim().length > 0;
+    const quotedContext = parsedMessage.quotedContext;
+    const slashCommand = matchingSlashCommand(userContent, slashCommands);
+    const messageText = slashCommand ? (
+      <>
+        <SlashCommandText command={slashCommand.command} />
+        <UserMessageText
+          text={userContent.slice(slashCommand.command.length)}
+          cliApps={mentionCliApps}
+          mcpPresets={mentionMcpPresets}
+        />
+      </>
+    ) : (
+      <UserMessageText
+        text={userContent}
+        cliApps={mentionCliApps}
+        mcpPresets={mentionMcpPresets}
+      />
+    );
     return (
       <div
         className={cn(
@@ -69,15 +192,28 @@ export function MessageBubble({ message }: MessageBubbleProps) {
         {!hasImages && hasMedia ? (
           <MessageMedia media={media} align="right" />
         ) : null}
+        {quotedContext ? (
+          <UserQuotedContext
+            text={quotedContext}
+            label={t("thread.composer.quotedContext")}
+          />
+        ) : null}
         {hasText ? (
           <p
             className={cn(
-              "ml-auto w-fit rounded-[18px] bg-secondary/70 px-4 py-2",
-              "text-left text-[16px]/[1.75] whitespace-pre-wrap break-words",
+              "ml-auto w-fit max-w-full min-w-0 rounded-[18px] bg-secondary/70 px-4 py-2",
+              "text-left text-[16px]/[1.75] whitespace-pre-wrap [overflow-wrap:anywhere]",
             )}
           >
-            {message.content}
+            {messageText}
           </p>
+        ) : null}
+        {hasText && showCopyAction ? (
+          <TooltipProvider delayDuration={220} skipDelayDuration={80}>
+            <div className="flex min-h-8 items-center justify-end text-muted-foreground">
+              <MessageCopyButton content={message.content} />
+            </div>
+          </TooltipProvider>
         ) : null}
       </div>
     );
@@ -85,41 +221,220 @@ export function MessageBubble({ message }: MessageBubbleProps) {
 
   const empty = message.content.trim().length === 0;
   const media = message.media ?? [];
+  const reasoning = message.role === "assistant" ? message.reasoning ?? "" : "";
+  const reasoningStreaming = !!(message.role === "assistant" && message.reasoningStreaming);
+  const hasReasoning = reasoning.length > 0 || reasoningStreaming;
+  const automationSourceKind = message.source?.kind;
+  const automationSourceName = message.source?.label?.trim();
+  const automationSourceLabel = (
+    automationSourceKind === "cron"
+    || automationSourceKind === "local_trigger"
+    || automationSourceKind === "trigger"
+  )
+    ? (automationSourceName || t("message.automationSourceFallback"))
+    : "";
+  const automationTriggeredLabel = t("message.automationTriggered");
+
   const showAssistantActions = message.role === "assistant" && !message.isStreaming && !empty;
+  const showCopyButton = showCopyAction && showAssistantActions;
+  const showForkButton = showAssistantActions && !!onForkFromHere;
+  const forkLabel = t("message.forkFromHere");
+  const completedAt = message.completedAt;
+  const completedAtLabel =
+    message.role === "assistant" && !message.isStreaming
+      ? formatMessageEndTime(completedAt)
+      : "";
+  const showCompletedAt =
+    completedAtLabel.length > 0
+    && (!empty || hasReasoning || media.length > 0);
+  const completedAtTitle = showCompletedAt ? fmtDateTime(completedAt) : "";
+  const showAssistantFooterRow = showCopyButton || showForkButton || showCompletedAt;
+  const showAssistantFooterSlot =
+    message.role === "assistant"
+    && (!empty || hasReasoning || media.length > 0);
   return (
     <div className={cn("w-full text-[15px]", baseAnim)} style={{ lineHeight: "var(--cjk-line-height)" }}>
-      {empty && message.isStreaming ? (
-        <TypingDots />
-      ) : (
+      {hasReasoning ? (
+        <ReasoningBubble
+          text={reasoning}
+          streaming={reasoningStreaming}
+          hasBodyBelow={!empty}
+        />
+      ) : null}
+      {empty && message.isStreaming && !hasReasoning ? (
+        <ThinkingState />
+      ) : empty && message.isStreaming ? null : (
         <>
-          <MarkdownText>{message.content}</MarkdownText>
-          {message.isStreaming && <StreamCursor />}
-          {media.length > 0 ? <MessageMedia media={media} align="left" /> : null}
-          {showAssistantActions ? (
-            <div className="mt-2 flex items-center gap-1 text-muted-foreground">
-              <button
-                type="button"
-                onClick={onCopyAssistantReply}
-                aria-label={copied ? t("message.copiedReply") : t("message.copyReply")}
-                title={copied ? t("message.copiedReply") : t("message.copyReply")}
-                className={cn(
-                  "inline-flex h-8 w-8 items-center justify-center rounded-full",
-                  "transition-colors hover:bg-muted/55 hover:text-foreground",
-                  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                )}
-              >
-                {copied ? (
-                  <Check className="h-4 w-4" aria-hidden />
-                ) : (
-                  <Copy className="h-4 w-4" aria-hidden />
-                )}
-              </button>
-            </div>
+          {automationSourceLabel ? (
+            <AutomationSourceBadge
+              label={automationSourceLabel}
+              triggerLabel={automationTriggeredLabel}
+            />
           ) : null}
+          <div data-assistant-selectable={message.isStreaming ? undefined : "true"}>
+            {/* A mode switch rebuilds Streamdown's subtree and moves the scroll anchor. */}
+            <MarkdownText
+              streaming={!!message.isStreaming}
+              preserveStreamingLayout
+              onOpenFilePreview={onOpenFilePreview}
+            >
+              {message.content}
+            </MarkdownText>
+          </div>
+          {media.length > 0 ? <MessageMedia media={media} align="left" /> : null}
         </>
       )}
+      {showAssistantFooterSlot ? (
+        <TooltipProvider delayDuration={220} skipDelayDuration={80}>
+          <div
+            data-assistant-footer
+            data-state={showAssistantFooterRow ? "visible" : "reserved"}
+            aria-hidden={showAssistantFooterRow ? undefined : true}
+            className={cn(
+              "mt-2 flex min-h-8 flex-wrap items-center gap-x-2 gap-y-1 text-muted-foreground",
+              "transition-opacity duration-300 ease-out motion-reduce:transition-none",
+              showAssistantFooterRow
+                ? "opacity-100"
+                : "pointer-events-none opacity-0",
+            )}
+          >
+            {showCopyButton ? (
+              <MessageCopyButton content={message.content} />
+            ) : null}
+            {showForkButton ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    onClick={onForkFromHere}
+                    aria-label={forkLabel}
+                    className={cn(
+                      "touch-target inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full",
+                      "transition-colors hover:bg-muted/55 hover:text-foreground",
+                      "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    )}
+                  >
+                    <ForkArrowIcon className="h-4 w-4" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="top" align="center">{forkLabel}</TooltipContent>
+              </Tooltip>
+            ) : null}
+            {showCompletedAt ? (
+              <time
+                data-assistant-completed-at
+                dateTime={new Date(completedAt!).toISOString()}
+                className="text-[11px] leading-none text-muted-foreground/70 tabular-nums"
+                title={completedAtTitle}
+              >
+                {completedAtLabel}
+              </time>
+            ) : null}
+          </div>
+        </TooltipProvider>
+      ) : null}
     </div>
   );
+}
+
+function UserQuotedContext({ text, label }: { text: string; label: string }) {
+  return (
+    <blockquote
+      className={cn(
+        "ml-auto flex w-fit max-w-full min-w-0 items-start gap-2 rounded-[14px]",
+        "border border-border/60 bg-muted/35 px-3 py-2 text-left text-muted-foreground",
+      )}
+      aria-label={label}
+      title={text}
+    >
+      <Quote className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+      <p className="min-w-0 line-clamp-3 whitespace-pre-wrap text-[13px]/[1.45] [overflow-wrap:anywhere]">
+        {text}
+      </p>
+    </blockquote>
+  );
+}
+
+function AutomationSourceBadge({ label, triggerLabel }: { label: string; triggerLabel: string }) {
+  return (
+    <div
+      className={cn(
+        "mb-2 inline-flex max-w-full items-center gap-1.5 rounded-full px-2 py-1",
+        "border border-sky-500/15 bg-sky-500/[0.06]",
+        "text-[11px] font-medium leading-none text-sky-700",
+        "dark:border-sky-300/15 dark:bg-sky-300/[0.08] dark:text-sky-200/80",
+      )}
+      title={triggerLabel}
+    >
+      <Clock3 className="h-3 w-3 shrink-0" aria-hidden />
+      <span className="min-w-0 truncate">{label}</span>
+      <span className="text-current/45" aria-hidden>·</span>
+      <span className="shrink-0">{triggerLabel}</span>
+    </div>
+  );
+}
+
+function mergeMcpMentionPresets(
+  presets: McpPresetInfo[],
+  attachments: UIMcpPresetAttachment[] | undefined,
+): McpPresetInfo[] {
+  if (!attachments?.length) return presets;
+  const byName = new Map(presets.map((preset) => [preset.name.toLowerCase(), preset]));
+  for (const attachment of attachments) {
+    const name = attachment.name?.trim();
+    if (!name) continue;
+    const existing = byName.get(name.toLowerCase());
+    byName.set(name.toLowerCase(), {
+      name,
+      display_name: attachment.display_name || existing?.display_name || name,
+      category: attachment.category || existing?.category || "mcp",
+      description: existing?.description || "",
+      docs_url: existing?.docs_url || "",
+      transport: attachment.transport || existing?.transport || "mcp",
+      requires: existing?.requires || "",
+      note: existing?.note || "",
+      install_supported: existing?.install_supported ?? true,
+      installed: true,
+      configured: attachment.configured ?? existing?.configured ?? true,
+      available: existing?.available ?? true,
+      status: attachment.status || existing?.status || "configured",
+      logo_url: attachment.logo_url ?? existing?.logo_url ?? null,
+      brand_color: attachment.brand_color ?? existing?.brand_color ?? null,
+      required_fields: existing?.required_fields || [],
+      connection_summary: existing?.connection_summary || "",
+    });
+  }
+  return Array.from(byName.values());
+}
+
+function mergeCliMentionApps(
+  cliApps: CliAppInfo[],
+  attachments: UICliAppAttachment[] | undefined,
+): CliAppInfo[] {
+  if (!attachments?.length) return cliApps;
+  const byName = new Map(cliApps.map((app) => [app.name.toLowerCase(), app]));
+  for (const attachment of attachments) {
+    const name = attachment.name?.trim();
+    if (!name) continue;
+    const existing = byName.get(name.toLowerCase());
+    byName.set(name.toLowerCase(), {
+      name,
+      display_name: attachment.display_name || existing?.display_name || name,
+      category: attachment.category || existing?.category || "cli",
+      description: existing?.description || "",
+      requires: existing?.requires || "",
+      source: existing?.source || "attached",
+      entry_point: attachment.entry_point || existing?.entry_point || "",
+      install_supported: existing?.install_supported ?? true,
+      installed: true,
+      available: existing?.available ?? true,
+      status: existing?.status || "installed",
+      logo_url: attachment.logo_url ?? existing?.logo_url ?? null,
+      brand_color: attachment.brand_color ?? existing?.brand_color ?? null,
+      skill_installed: existing?.skill_installed ?? true,
+    });
+  }
+  return Array.from(byName.values());
 }
 
 function MessageMedia({
@@ -130,10 +445,16 @@ function MessageMedia({
   align: "left" | "right";
 }) {
   if (media.length === 0) return null;
-  const images = media
-    .filter((item) => item.kind === "image")
-    .map(({ url, name }) => ({ url, name }));
-  const nonImages = media.filter((item) => item.kind !== "image");
+  const images: UIImage[] = [];
+  const nonImages: UIMediaAttachment[] = [];
+  for (const item of media) {
+    const normalized = toMediaAttachment(item);
+    if (normalized.kind === "image") {
+      images.push({ url: normalized.url, name: normalized.name });
+    } else {
+      nonImages.push(normalized);
+    }
+  }
 
   return (
     <div
@@ -146,59 +467,14 @@ function MessageMedia({
         <UserImages images={images} align={align} size={align === "left" ? "large" : "compact"} />
       ) : null}
       {nonImages.map((item, i) => (
-        <MediaCell key={`${item.url ?? item.name ?? item.kind}-${i}`} media={item} />
+        <AttachmentTile key={`${item.url ?? item.name ?? item.kind}-${i}`} attachment={item} />
       ))}
-    </div>
-  );
-}
-
-function MediaCell({ media }: { media: UIMediaAttachment }) {
-  const { t } = useTranslation();
-  const hasUrl = typeof media.url === "string" && media.url.length > 0;
-
-  if (media.kind === "video" && hasUrl) {
-    return (
-      <figure className="max-w-[min(100%,32rem)] overflow-hidden rounded-[14px] border border-border/60 bg-muted/40">
-        <video
-          src={media.url}
-          controls
-          preload="metadata"
-          className="block max-h-[26rem] w-full bg-black"
-          aria-label={media.name ? `${t("message.videoAttachment", { defaultValue: "Video attachment" })}: ${media.name}` : t("message.videoAttachment", { defaultValue: "Video attachment" })}
-        />
-        {media.name ? (
-          <figcaption className="truncate px-3 py-1.5 text-[11.5px] text-muted-foreground">
-            {media.name}
-          </figcaption>
-        ) : null}
-      </figure>
-    );
-  }
-
-  const label =
-    media.kind === "video"
-      ? t("message.videoAttachment", { defaultValue: "Video attachment" })
-      : t("message.fileAttachment", { defaultValue: "File attachment" });
-  const Icon = media.kind === "video" ? PlaySquare : FileIcon;
-
-  return (
-    <div
-      className="flex max-w-[18rem] items-center gap-2 rounded-[14px] border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
-      title={media.name ?? undefined}
-      aria-label={label}
-    >
-      <Icon className="h-4 w-4 flex-none" aria-hidden />
-      <span className="truncate">{media.name ?? label}</span>
     </div>
   );
 }
 
 /**
  * Right-aligned preview row for images attached to a user turn.
- *
- * Visual follows agent-chat-ui: a single wrapping row of fixed-size square
- * thumbnails that stay modest next to the text pill regardless of how many
- * images are attached.
  *
  * The URL is expected to be a self-contained ``data:`` URL (the Composer
  * hands the normalized base64 payload to the optimistic bubble so that the
@@ -219,13 +495,14 @@ function UserImages({
   const { t } = useTranslation();
   // Only real-URL images can open in the lightbox; historical-replay
   // placeholders (no URL) have nothing to zoom into.
-  const viewable = images
-    .map((img, i) => ({ img, i }))
-    .filter(({ img }) => typeof img.url === "string" && img.url.length > 0);
-  const viewableImages = viewable.map(({ img }) => img);
-  const originalToViewable = new Map<number, number>(
-    viewable.map(({ i }, v) => [i, v]),
-  );
+  const viewableImages: UIImage[] = [];
+  const originalToViewable = new Map<number, number>();
+  for (let i = 0; i < images.length; i += 1) {
+    const img = images[i];
+    if (typeof img.url !== "string" || img.url.length === 0) continue;
+    originalToViewable.set(i, viewableImages.length);
+    viewableImages.push(img);
+  }
 
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
 
@@ -332,42 +609,68 @@ function UserImageCell({
   );
 }
 
-/** Blinking cursor appended at the end of streaming text. */
-function StreamCursor() {
-  const { t } = useTranslation();
-  return (
-    <span
-      aria-label={t("message.streaming")}
-      className={cn(
-        "ml-0.5 inline-block h-[1em] w-[3px] translate-y-[2px] align-middle",
-        "rounded-sm bg-foreground/70 animate-pulse",
-      )}
-    />
-  );
-}
-
-/** Pre-token-arrival placeholder: three bouncing dots. */
-function TypingDots() {
+/** Quiet pre-token state that occupies a stable line in the answer column. */
+function ThinkingState() {
   const { t } = useTranslation();
   return (
     <span
       aria-label={t("message.assistantTyping")}
-      className="inline-flex items-center gap-1 py-1"
+      className="inline-flex min-h-7 items-center py-1 text-[13px]"
     >
-      <Dot delay="0ms" />
-      <Dot delay="150ms" />
-      <Dot delay="300ms" />
+      <StreamingLabelSheen active>
+        {t("message.reasoningStreaming", { defaultValue: "Thinking…" })}
+      </StreamingLabelSheen>
     </span>
   );
 }
 
-function Dot({ delay }: { delay: string }) {
+/** L→R sheen on the glyphs themselves; inactive labels stay solid muted text. */
+export function StreamingLabelSheen({
+  children,
+  active,
+  className,
+}: {
+  children: ReactNode;
+  active: boolean;
+  className?: string;
+}) {
+  const sheenText =
+    typeof children === "string" || typeof children === "number"
+      ? String(children)
+      : undefined;
   return (
-    <span
-      style={{ animationDelay: delay }}
+    <span className={cn("block min-w-0 overflow-hidden py-px", className)}>
+      <span
+        data-sheen-text={active ? sheenText : undefined}
+        className={cn(
+          "block w-fit max-w-full truncate font-medium leading-normal",
+          active ? "streaming-text-sheen" : "text-muted-foreground",
+        )}
+      >
+        {children}
+      </span>
+    </span>
+  );
+}
+
+interface ReasoningBubbleProps {
+  text: string;
+  streaming: boolean;
+  hasBodyBelow: boolean;
+}
+
+export function ReasoningBubble({
+  text,
+  streaming,
+  hasBodyBelow,
+}: ReasoningBubbleProps) {
+  return (
+    <ReasoningRow
+      text={text}
+      streaming={streaming}
       className={cn(
-        "inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/60",
-        "animate-bounce",
+        "animate-in fade-in-0 slide-in-from-top-1 duration-200",
+        hasBodyBelow && "mb-2",
       )}
     />
   );
@@ -380,14 +683,14 @@ interface TraceGroupProps {
 
 /**
  * Collapsible group of tool-call / progress breadcrumbs. Defaults to
- * expanded for discoverability; a single click on the header folds the
- * group down to a one-line summary so it never dominates the thread.
+ * collapsed because tool traces are supporting evidence, not the answer.
+ * A single click expands the exact calls when the user wants details.
  */
-function TraceGroup({ message, animClass }: TraceGroupProps) {
+export function TraceGroup({ message, animClass }: TraceGroupProps) {
   const { t } = useTranslation();
   const lines = message.traces ?? [message.content];
   const count = lines.length;
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(false);
   return (
     <div className={cn("w-full", animClass)}>
       <button

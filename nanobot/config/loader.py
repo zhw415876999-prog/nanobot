@@ -7,13 +7,14 @@ from pathlib import Path
 from typing import Any
 
 import pydantic
-from loguru import logger
 from pydantic import BaseModel
 
-from nanobot.config.schema import Config
+from nanobot.config.schema import Config, _resolve_tool_config_refs
+from nanobot.utils.helpers import _write_text_atomic
 
 # Global variable to store current config path (for multi-instance support)
 _current_config_path: Path | None = None
+_schema_refs_ready = False
 
 
 def set_config_path(path: Path) -> None:
@@ -39,6 +40,11 @@ def load_config(config_path: Path | None = None) -> Config:
     Returns:
         Loaded configuration object.
     """
+    global _schema_refs_ready
+    if not _schema_refs_ready:
+        _resolve_tool_config_refs()
+        _schema_refs_ready = True
+
     path = config_path or get_config_path()
 
     config = Config()
@@ -49,8 +55,7 @@ def load_config(config_path: Path | None = None) -> Config:
             data = _migrate_config(data)
             config = Config.model_validate(data)
         except (json.JSONDecodeError, ValueError, pydantic.ValidationError) as e:
-            logger.warning("Failed to load config from {}: {}", path, e)
-            logger.warning("Using default configuration.")
+            raise ValueError(f"Failed to load config from {path}: {e}") from e
 
     _apply_ssrf_whitelist(config)
     return config
@@ -75,9 +80,37 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     data = config.model_dump(mode="json", by_alias=True)
+    # OAuth credentials live in dedicated token stores. Persist only the
+    # non-credential request settings consumed by these provider backends.
+    for alias, provider in (
+        ("openaiCodex", config.providers.openai_codex),
+        ("xaiGrok", config.providers.xai_grok),
+    ):
+        settings = provider.model_dump(
+            mode="json",
+            by_alias=True,
+            include={"proxy", "extra_body"},
+            exclude_none=True,
+        )
+        if settings:
+            data.setdefault("providers", {})[alias] = settings
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    # Temp + replace so a crash mid-write cannot leave a truncated config.json.
+    _write_text_atomic(path, json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def merge_missing_defaults(existing: Any, defaults: Any) -> Any:
+    """Recursively add missing defaults without replacing configured values."""
+    if not isinstance(existing, dict) or not isinstance(defaults, dict):
+        return existing
+
+    merged = dict(existing)
+    for key, value in defaults.items():
+        if key not in merged:
+            merged[key] = value
+        else:
+            merged[key] = merge_missing_defaults(merged[key], value)
+    return merged
 
 
 _ENV_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -86,12 +119,29 @@ _ENV_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 def resolve_config_env_vars(config: Config) -> Config:
     """Return *config* with ``${VAR}`` env-var references resolved.
 
-    Walks in place so fields declared with ``exclude=True`` (e.g.
-    ``DreamConfig.cron``) survive; returns the same instance when no
-    references are present. Raises ``ValueError`` if a referenced
-    variable is not set.
+    Walks in place so fields declared with ``exclude=True`` survive;
+    returns the same instance when no references are present.
+    Raises ``ValueError`` if a referenced variable is not set.
     """
     return _resolve_in_place(config)
+
+
+def resolve_env_refs(value: str) -> str:
+    """Resolve ``${VAR}`` references in a single string, leniently.
+
+    Unlike :func:`resolve_config_env_vars` (which walks a whole ``Config`` and
+    raises on a missing variable), this resolves one value and returns an empty
+    string if any reference is unset. It is meant for individual, lazily consumed
+    fields — e.g. a transcription provider's ``api_key`` or ``api_base`` — so a
+    missing variable degrades to "not configured" instead of producing a partial
+    value. Non-string input is returned unchanged.
+    """
+    if not isinstance(value, str):
+        return value
+    names = _ENV_REF_PATTERN.findall(value)
+    if any(name not in os.environ for name in names):
+        return ""
+    return _ENV_REF_PATTERN.sub(lambda m: os.environ[m.group(1)], value)
 
 
 def _resolve_in_place(obj: Any) -> Any:
