@@ -32,8 +32,7 @@ AUTH_HEADERS = {"Authorization": f"Bearer {API_KEY}"}
 def _make_mock_agent(response_text: str = "mock response") -> MagicMock:
     agent = MagicMock()
     agent.process_direct = AsyncMock(return_value=response_text)
-    agent._connect_mcp = AsyncMock()
-    agent.close_mcp = AsyncMock()
+    agent.aclose = AsyncMock()
     agent._last_usage = {}
     return agent
 
@@ -153,6 +152,28 @@ def test_parse_json_content_validates_user_role() -> None:
     """Non-user role raises ValueError."""
     body = {"messages": [{"role": "system", "content": "you are a bot"}]}
     with pytest.raises(ValueError, match="single user message"):
+        _parse_json_content(body)
+
+
+@pytest.mark.parametrize(
+    ("part", "field"),
+    [
+        ({"type": "text", "text": 1}, r"content\[\]\.text"),
+        (
+            {"type": "image_url", "image_url": "not-an-object"},
+            r"content\[\]\.image_url",
+        ),
+        (
+            {"type": "image_url", "image_url": {"url": 1}},
+            r"image_url\.url",
+        ),
+    ],
+)
+def test_parse_json_content_validates_typed_block_fields(part, field) -> None:
+    """Dynamic content blocks are checked before their values reach typed code."""
+    body = {"messages": [{"role": "user", "content": [part]}]}
+
+    with pytest.raises(TypeError, match=field):
         _parse_json_content(body)
 
 
